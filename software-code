@@ -1,0 +1,391 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// Replace with your network credentials
+#define WIFI_SSID "Azeneth"
+#define WIFI_PASSWORD "mmpt2761"
+
+#define API_KEY "AIzaSyDBe4hu4DNDTPIWdd-9iVkwNOeAbXeT8sk"
+#define DATABASE_URL "https://remedi-appl-default-rtdb.firebaseio.com/"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Function Prototypes
+void loadHasDispensed();
+void saveHasDispensed();
+bool isFreshUpload();
+void saveMedicationName();
+void loadMedicationName();
+void saveDispenseTime();
+void loadDispenseTime();
+void dispenseMedication();
+void moveServoTo(int targetAngle, int speedDelay);
+void checkPowerRestore();
+bool isPastDispenseTime(DateTime now);
+void parseSerialInput(String input);
+void displayTime(DateTime now);
+
+// LCD, RTC, and Servo setup
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+RTC_DS3231 rtc;
+Servo servoMotor;
+
+// Pins
+const int buttonPin = 15;
+const int cupSensorPin = 4;
+const int servoPin = 18;
+
+// EEPROM addresses
+#define MEDICATION_NAME_ADDR 0
+#define MEDICATION_MAX_LEN 20
+#define HAS_DISPENSED_ADDR 40
+
+// Global variables
+String medicationName = "Medication";
+int dispenseHour = -1;
+int dispenseMinute = -1;
+int pillCount = 30;
+bool buttonPressed = false;
+bool hasDispensed = false;
+
+void setup() {
+  Serial.begin(115200);
+  lcd.begin();
+  lcd.backlight();
+  Wire.begin(21, 22);
+
+  pinMode(buttonPin, INPUT_PULLDOWN);
+  pinMode(cupSensorPin, INPUT);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  lcd.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  lcd.clear();
+  lcd.print("WiFi Connected");
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = "";
+  auth.user.password = "";
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  delay(2000);
+
+  if (!rtc.begin()) {
+    lcd.clear();
+    lcd.print("RTC Error");
+    while (1);
+  }
+
+  EEPROM.begin(512);
+  loadHasDispensed();
+
+  if (isFreshUpload()) {
+    medicationName = "Medication";
+    saveMedicationName();
+    hasDispensed = false;
+    saveHasDispensed();
+  } else {
+    loadMedicationName();
+    loadHasDispensed();
+    loadDispenseTime();
+    checkPowerRestore();
+  }
+
+  if (Firebase.RTDB.getString(&fbdo, "/medicationName")) {
+    medicationName = fbdo.stringData();
+    saveMedicationName();
+  }
+  if (Firebase.RTDB.getInt(&fbdo, "/dispenseHour")) {
+    dispenseHour = fbdo.intData();
+  }
+  if (Firebase.RTDB.getInt(&fbdo, "/dispenseMinute")) {
+    dispenseMinute = fbdo.intData();
+  }
+  if (Firebase.RTDB.getInt(&fbdo, "/pillCount")) {
+    pillCount = fbdo.intData();
+  }
+
+  servoMotor.attach(servoPin);
+  servoMotor.write(0);
+
+  DateTime now = rtc.now();
+  displayTime(now);
+  if (now.hour() < dispenseHour || (now.hour() == dispenseHour && now.minute() < dispenseMinute)) {
+    lcd.print("Not time");
+  } else {
+    lcd.print("Ready");
+  }
+
+  checkPowerRestore();
+}
+
+void loop() {
+  DateTime now = rtc.now();
+  displayTime(now);
+
+  static int lastDay = -1;
+  int currentDay = now.day();
+  if (currentDay != lastDay) {
+    hasDispensed = false;
+    saveHasDispensed();
+    Firebase.RTDB.setBool(&fbdo, "/hasDispensed", false);
+    lastDay = currentDay;
+  }
+
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    parseSerialInput(input);
+  }
+
+  if (digitalRead(buttonPin) == LOW) {
+    delay(50);
+    if (digitalRead(buttonPin) == LOW) {
+      buttonPressed = true;
+    }
+  }
+
+  if (buttonPressed) {
+    buttonPressed = false;
+
+    if (pillCount <= 0) {
+      lcd.clear();
+      lcd.print("Refill");
+    } else if (now.hour() < dispenseHour || (now.hour() == dispenseHour && now.minute() < dispenseMinute)) {
+      lcd.clear();
+      lcd.print("Not time");
+    } else if (!hasDispensed) {
+      if (digitalRead(cupSensorPin) == HIGH) {
+        lcd.clear();
+        lcd.print("No cup");
+      } else {
+        dispenseMedication();
+        hasDispensed = true;
+        saveHasDispensed();
+        Firebase.RTDB.setBool(&fbdo, "/hasDispensed", true);
+        Firebase.RTDB.setInt(&fbdo, "/pillCount", pillCount);
+      }
+    } else {
+      lcd.clear();
+      lcd.print("Already dispensed");
+    }
+  }
+
+  // ✅ Check for remote dispense request
+  if (Firebase.RTDB.getBool(&fbdo, "/patients/1/dispenserControl/request")) {
+    if (fbdo.dataType() == "boolean" && fbdo.boolData() == true) {
+      lcd.clear();
+      lcd.print("Remote Request");
+      delay(1000);
+
+      if (!hasDispensed && pillCount > 0 && digitalRead(cupSensorPin) == LOW) {
+        dispenseMedication();
+        hasDispensed = true;
+        saveHasDispensed();
+        Firebase.RTDB.setBool(&fbdo, "/hasDispensed", true);
+        Firebase.RTDB.setInt(&fbdo, "/pillCount", pillCount);
+      }
+
+      Firebase.RTDB.setBool(&fbdo, "/patients/1/dispenserControl/request", false);
+    }
+  }
+
+  delay(1000);
+}
+
+// Helper and Utility Functions
+bool isFreshUpload() {
+  return EEPROM.read(MEDICATION_NAME_ADDR) == 0xFF; // EEPROM is in default state
+}
+
+bool isPastDispenseTime(DateTime now) {
+  if (dispenseHour == -1 || dispenseMinute == -1) {
+    return false;  // Dispense time not set
+  }
+  return (now.hour() > dispenseHour || 
+          (now.hour() == dispenseHour && now.minute() >= dispenseMinute));
+}
+
+void dispenseMedication() {
+  lcd.clear();                          // Clear the LCD
+  lcd.print("Dispensing");              // Inform dispensing process has started
+
+  // Rotate servo to dispense medication (with controlled speed)
+  moveServoTo(180, 10);                 // Move to 180 degrees with speed control
+  delay(1000);                          // Wait for dispensing to complete
+  moveServoTo(0, 10);                   // Return servo to starting position
+  delay(1000);                          // Wait for servo to complete movement
+
+  // Decrement the pill count
+  pillCount--;                          // Reduce pill count by one
+  if (pillCount <= 0) {
+    lcd.clear();
+    lcd.print("Refill");
+  }
+
+  delay(2000);                          // Brief pause before next action
+}
+
+void checkPowerRestore() {
+  DateTime now = rtc.now();
+
+  if (dispenseHour == -1 || dispenseMinute == -1) {
+    lcd.clear();
+    lcd.print("No dispense time");
+    return;
+  }
+
+  // Check if it's time or past time to dispense but don't dispense automatically
+  if (isPastDispenseTime(now) && !hasDispensed) {
+    lcd.clear();
+    lcd.print("Ready to dispense");
+} else {
+    displayTime(now); // Call your displayTime() function to show the medication name and formatted time
+}
+}
+
+void saveMedicationName() {
+  for (int i = 0; i < MEDICATION_MAX_LEN; i++) {
+    if (i < medicationName.length()) {
+      EEPROM.write(MEDICATION_NAME_ADDR + i, medicationName[i]);
+    } else {
+      EEPROM.write(MEDICATION_NAME_ADDR + i, '\0'); // Write null terminator
+    }
+  }
+  EEPROM.commit(); // Ensure changes are written to EEPROM
+}
+
+void loadMedicationName() {
+  char savedName[MEDICATION_MAX_LEN];
+  for (int i = 0; i < MEDICATION_MAX_LEN; i++) {
+    savedName[i] = EEPROM.read(MEDICATION_NAME_ADDR + i);
+  }
+  medicationName = String(savedName); // Restore saved name
+}
+
+void saveDispenseTime() {
+  EEPROM.write(50, dispenseHour);       // Store dispense hour at address 50
+  EEPROM.write(51, dispenseMinute);    // Store dispense minute at address 51
+  EEPROM.commit();                     // Ensure data is saved to EEPROM
+}
+
+void loadDispenseTime() {
+  dispenseHour = EEPROM.read(50);      // Read dispense hour from address 50
+  dispenseMinute = EEPROM.read(51);   // Read dispense minute from address 51
+
+  // Ensure valid time data is loaded
+  if (dispenseHour > 23 || dispenseHour < 0) dispenseHour = -1;
+  if (dispenseMinute > 59 || dispenseMinute < 0) dispenseMinute = -1;
+}
+
+
+void moveServoTo(int targetAngle, int speedDelay) {
+  static int currentAngle = 0; // Keep track of the current position of the servo
+  while (currentAngle != targetAngle) {
+    if (currentAngle < targetAngle) {
+      currentAngle++;
+    } else if (currentAngle > targetAngle) {
+      currentAngle--;
+    }
+    servoMotor.write(currentAngle); // Update the servo position
+    delay(speedDelay);              // Delay to control speed
+  }
+}
+
+void saveHasDispensed() {
+  EEPROM.write(HAS_DISPENSED_ADDR, hasDispensed ? 1 : 0); // Save 1 for true, 0 for false
+  EEPROM.commit(); // Ensure data is written to EEPROM
+}
+
+void loadHasDispensed() {
+  hasDispensed = EEPROM.read(HAS_DISPENSED_ADDR) == 1; // Read and set the flag
+}
+
+void parseSerialInput(String input) {
+  if (input.startsWith("Name:")) {
+    // Extract and save medication name
+    medicationName = input.substring(5); // Get the text after "Name:"
+    saveMedicationName();                // Save name to EEPROM
+    lcd.clear();
+    lcd.print("Name updated");           // Notify user
+    delay(2000);
+  } 
+  else if (input.startsWith("Time:")) {
+    String timePart = input.substring(5);       // Get the text after "Time:"
+    int colonIndex = timePart.indexOf(':');     // Find the colon separating hours and minutes
+
+    if (colonIndex != -1) {
+        int hour = timePart.substring(0, colonIndex).toInt();    // Extract the hour
+        int minute = timePart.substring(colonIndex + 1, colonIndex + 3).toInt(); // Extract the minute
+        String period = timePart.substring(colonIndex + 4); // Extract "AM" or "PM"
+        period.trim(); // Trim the string to remove leading or trailing whitespace
+
+        // Convert 12-hour time to 24-hour time
+        if (period == "PM" && hour != 12) {
+            hour += 12;
+        } else if (period == "AM" && hour == 12) {
+            hour = 0; // Midnight is 0 in 24-hour time
+        }
+
+        // Validate and save the time
+        if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+            dispenseHour = hour;      // Save the hour in 24-hour format
+            dispenseMinute = minute; // Save the minute
+            saveDispenseTime();      // Save the time to EEPROM
+            hasDispensed = false;    // Reset dispensing state
+            saveHasDispensed();      // Persist the reset state
+            lcd.clear();
+            lcd.print("Time updated");
+            delay(1000);
+        } else {
+            lcd.clear();
+            lcd.print("Invalid time");
+            delay(1000);
+        }
+    } else {
+        lcd.clear();
+        lcd.print("Invalid format");
+        delay(1000);
+    }
+}
+}
+
+void displayTime(DateTime now) {
+    lcd.clear();
+    lcd.print(medicationName); // Display the medication name
+    lcd.setCursor(0, 1);       // Move to the second row
+
+    int hour = now.hour();    // Get the current hour in 24-hour format
+    int minute = now.minute(); // Get the current minute
+    String period = "AM";     // Default to AM
+
+    // Convert 24-hour time to 12-hour format
+    if (hour >= 12) {
+        period = "PM";        // Change to PM for hours >= 12
+        if (hour > 12) {
+            hour -= 12;       // Convert hours > 12 to 12-hour format
+        }
+    } else if (hour == 0) {
+        hour = 12;            // Handle midnight as 12 AM
+    }
+
+    // Print the time to the LCD
+    lcd.print(hour < 10 ? "0" : ""); // Add leading zero for single-digit hours
+    lcd.print(hour);
+    lcd.print(":");
+    lcd.print(minute < 10 ? "0" : ""); // Add leading zero for single-digit minutes
+    lcd.print(minute);
+    lcd.print(" ");
+    lcd.print(period); // Display AM/PM
+}
